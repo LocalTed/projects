@@ -1,0 +1,618 @@
+%{
+    #include <iostream>
+    #include <stdlib.h>
+    using namespace std;
+    #include "source.hpp"
+    #include "hw3_output.hpp"
+    #include "llvmcode.hpp"
+    extern Symtab symtable;
+
+    extern int yylex();
+    extern int yylineno;
+    int yyerror(const char* message);
+    Symtab symtable;
+    LlvmCodeHandler handler;
+    std::vector<Node*> allocatedNodes;
+
+    void closeScope(){
+        if(!symtable.tableStack.empty()){
+                //output::endScope();
+                symtable.tableStack.top()->printTable();
+                symtable.tableStack.top()->deleteTable();
+                symtable.tableStack.pop();
+                symtable.offsetsStack.pop();
+        }
+    }
+    void cleanUpNodes() {
+    for (Node* node : allocatedNodes) {
+        delete node;
+    }
+    allocatedNodes.clear();
+}
+%}
+
+
+
+
+%nonassoc INT;
+%nonassoc BYTE;
+%nonassoc B;
+%nonassoc BOOL;
+%nonassoc TRUE;
+%nonassoc FALSE;
+%nonassoc RETURN;
+%nonassoc WHILE;
+%nonassoc BREAK;
+%nonassoc CONTINUE;
+%nonassoc SC;
+%nonassoc COMMA;
+%nonassoc LBRACE;
+%nonassoc RBRACE;
+%nonassoc ID;
+%nonassoc NUM;
+%nonassoc STRING;
+%nonassoc COMMENT;
+%right ASSIGN;
+%left OR;
+%left AND;
+%left EQUAL;
+%left RELATIONAL;
+%left BINOP;
+%left MULT;
+%right IF;
+%right NOT;
+%left RPAREN;
+%left LPAREN;
+%right ELSE;
+
+%%
+
+program:    statements {};
+
+statements: statement {};
+
+statements: statements statement {};
+
+statement:  LBRACE openScopeMarker statements RBRACE 
+            {
+                closeScope();
+            }
+
+openScopeMarker:        %empty
+                        {
+                            symtable.addTable(symtable.tableStack.top());};
+
+statement:  type ID SC 
+            {
+                Symtab::Table::Entry* entry = symtable.find(((IdNode*)$2)->id);
+                if(entry){
+                    output::errorDef($$->lineno, ((IdNode*)$2)->id);
+                    cleanUpNodes();
+                    exit(1);
+                    }
+
+                handler.allocate_var($1->type, ((IdNode*)$2)->id, new Node(0));
+            };
+
+statement:  type ID ASSIGN exp SC 
+            {   
+                Symtab::Table::Entry* entry = symtable.find(((IdNode*)$2)->id);
+                if(entry){
+                    output::errorDef($$->lineno, ((IdNode*)$2)->id);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                string type1 = $1->type;
+                string type2 = $4->type;
+                if((type1 != type2) && !(type1=="INT" && type2=="BYTE")){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+                
+                handler.allocate_var(type1, ((IdNode*)$2)->id, $4);
+                };
+
+statement:  ID ASSIGN exp SC
+            {   
+                string type1 = $1->type;
+
+                Symtab::Table::Entry* entry = symtable.find(((IdNode*)$1)->id);
+                if(!entry){
+                    output::errorUndef($$->lineno, ((IdNode*)$1)->id);
+                    cleanUpNodes();
+                    exit(1);
+                } else {
+                    if(entry->funcArg != ""){
+                        output::errorUndef($$->lineno, ((IdNode*)$1)->id);
+                        cleanUpNodes();
+                        exit(1);
+                    }
+                    type1 = entry->type;
+                }
+                
+                string type2 = $3->type;
+                if(type1 != type2 && !(type1=="INT" && type2=="BYTE")){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                handler.change_var_value(entry->name, $3);                
+            };
+
+statement:  call SC {};
+
+statement:  RETURN SC { handler.codeBuffer.emit("ret i32 0"); };
+
+//𝑆 → 𝑖𝑓 𝑩 𝑴 𝑡ℎ𝑒𝑛 𝑺1
+
+statement:  IF openScopeMarker LPAREN boolcheck RPAREN statement CloseScopeMarker
+            {
+                handler.codeBuffer.emit("br label %" + ((BoolVarNode*)$4)->falselab);
+                handler.codeBuffer.emit(((BoolVarNode*)$4)->falselab + ":");
+                //handler.codeBuffer.emit(handler.if_labels.top() + ":"); // why was this needed?
+                //handler.if_labels.pop();
+                //closeScope();
+                };
+
+
+//𝑆 → 𝑖𝑓 𝑩 𝑡ℎ𝑒𝑛 𝑴𝟏 𝑺𝟏  𝑒𝑙𝑠𝑒 𝑁 𝑴2𝑺2
+
+statement:    IF openScopeMarker LPAREN boolcheck RPAREN statement CloseScopeMarker ELSE skipMarker {handler.codeBuffer.emit(((BoolVarNode*)$4)->falselab + ":");} openScopeMarker statement CloseScopeMarker
+            {
+                handler.codeBuffer.emit("br label %" + $9->next);
+                handler.codeBuffer.emit($9->next + ":");
+            };
+
+
+skipMarker: %empty
+            {
+                $$ = new Node(0);
+                $$->next = handler.codeBuffer.freshLabel();
+                handler.codeBuffer.emit("br label %" + $$->next);
+            }
+
+CloseScopeMarker:  %empty 
+                    {
+                        closeScope();
+                    }
+
+
+statement:  WHILE openScopeMarker whileCheck LPAREN boolcheck RPAREN statement 
+            {
+                closeScope();
+
+                handler.codeBuffer.emit("br label %" + $3->next); //go back to start
+
+                handler.codeBuffer.emit("br label %" + ((BoolVarNode*)$5)->falselab);
+                handler.codeBuffer.emit(((BoolVarNode*)$5)->falselab + ":"); //where while goes if exp wrong
+
+                handler.codeBuffer.emit("br label %" + handler.break_labels.top());
+                handler.codeBuffer.emit(handler.break_labels.top() + ":");
+                handler.break_labels.pop();
+            };
+
+
+boolcheck:  exp 
+            {
+                if($1->type != "BOOL"){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                //br i1 %var_1 label %label_true, label %label_false
+
+                string truelab = handler.codeBuffer.freshLabel();
+                string falselab = handler.codeBuffer.freshLabel();
+
+
+                if(dynamic_cast<IdNode*>($1)){
+                    string branchVar = handler.freshVar();
+                    handler.codeBuffer.emit(branchVar + " = trunc i32 " + $1->var + " to i1");
+                    $1->var = branchVar;
+                }
+
+                handler.codeBuffer.emit("br i1 " + $1->var + ", label %" + truelab + ", label %" + falselab);
+                handler.codeBuffer.emit(truelab + ":");
+                //handler.if_labels.push(falselab);
+
+                $$ = new BoolVarNode($1->lineno, $1->type, $1->var);
+                ((BoolVarNode*)$$)->truelab = truelab;
+                ((BoolVarNode*)$$)->falselab = falselab;
+            }
+
+
+whileCheck: %empty  
+            { 
+                symtable.tableStack.top()->isWhile = true;
+
+                string contlabel = handler.codeBuffer.freshLabel();
+                string breaklabel = handler.codeBuffer.freshLabel();
+                handler.cont_labels.push(contlabel);
+                handler.break_labels.push(breaklabel);
+
+                handler.codeBuffer.emit("br label %" + contlabel);
+                handler.codeBuffer.emit(contlabel + ":");
+
+                $$ = new Node(0);
+                $$->next = handler.codeBuffer.freshLabel();
+                handler.codeBuffer.emit("br label %" + $$->next);
+                handler.codeBuffer.emit($$->next + ":");
+            }
+
+
+statement:  BREAK SC 
+            {
+                if(!symtable.isInWhile()){
+                    output::errorUnexpectedBreak($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                handler.codeBuffer.emit("br label %" + handler.break_labels.top());
+            };
+
+statement:  CONTINUE SC 
+            {
+                if(!symtable.isInWhile()){
+                    output::errorUnexpectedContinue($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                handler.codeBuffer.emit("br label %" + handler.cont_labels.top());
+            };
+
+call:       ID LPAREN exp RPAREN 
+            {
+                
+                if(((IdNode*)$1)->id == "print"){
+                    if($3->type != "STRING"){
+                        output::errorPrototypeMismatch($$->lineno, "print", "STRING");
+                        cleanUpNodes();
+                        exit(1);
+                    }
+                    $$ = new Node($$->lineno, "VOID");
+                    allocatedNodes.push_back($$);
+                    handler.codeBuffer.emit("call void @print(i8* " +  $3->var + ")");
+                }
+                else if(((IdNode*)$1)->id == "printi"){
+                    if($3->type != "INT" && $3->type != "BYTE"){
+                        output::errorPrototypeMismatch($$->lineno, "printi", "INT");
+                        cleanUpNodes();
+                        exit(1);
+                    }
+                    string inputVar = handler.freshVar();
+                    if($3->type == "BYTE" && !dynamic_cast<IdNode*>($3))
+                        handler.codeBuffer.emit(inputVar + " = zext i8 " + $3->var + " to i32"); 
+                    else handler.codeBuffer.emit(inputVar + " = add i32 " + $3->var + ", 0"); 
+
+                    handler.codeBuffer.emit("call void @printi(i32 " + inputVar + ")");
+
+                    $$ = new Node($$->lineno, "VOID");
+                    allocatedNodes.push_back($$);
+                }
+                else if(((IdNode*)$1)->id == "readi"){
+                    if($3->type != "INT" && $3->type != "BYTE"){
+                        output::errorPrototypeMismatch($$->lineno, "readi", "INT");
+                        cleanUpNodes();
+                        exit(1);
+                    }
+
+                    string retVal = handler.freshVar();
+                    handler.codeBuffer.emit(retVal + " = call i32 @readi(i32 " + $3->var + ")");
+                    $$ = new NumNode($$->lineno, 0, "INT", retVal);
+                    allocatedNodes.push_back($$);
+                }
+
+                else{
+                    output::errorUndefFunc($$->lineno, ((IdNode*)$1)->id);
+                    cleanUpNodes();
+                    exit(1);
+                }
+                
+            };
+
+type:       INT 
+            {
+                $$ = $1;
+            };
+
+type:       BYTE 
+            {
+                $$ = $1;
+            };
+
+type:       BOOL 
+            {
+                $$ = $1;
+            };
+
+exp:        LPAREN exp RPAREN 
+            {
+                $$ = $2;
+            };
+
+exp:        exp BINOP exp 
+            {
+                if(($1->type != "INT" && $1->type != "BYTE") || $3->type != "INT" && $3->type != "BYTE"){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                $$ = new Node($2->lineno, "INT", handler.freshVar());
+                allocatedNodes.push_back($$);
+                if($1->type == "BYTE" && $3->type == "BYTE"){
+                    $$->type = "BYTE";
+                }
+                handler.handle_binop($$, $1, $3, $2->type);
+                };
+            |
+            exp MULT exp
+            {
+                if(($1->type != "INT" && $1->type != "BYTE") || $3->type != "INT" && $3->type != "BYTE"){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                $$ = new Node($2->lineno, "INT", handler.freshVar());
+                allocatedNodes.push_back($$);
+                if($1->type == "BYTE" && $3->type == "BYTE"){
+                    $$->type = "BYTE";
+                }
+                handler.handle_binop($$, $1, $3, $2->type);
+            };
+
+exp:        ID
+            {
+                Symtab::Table::Entry* entry = symtable.find(((IdNode*)$1)->id);
+                if(!entry){
+                    output::errorUndef($$->lineno, ((IdNode*)$1)->id);
+                    cleanUpNodes();
+                    exit(1);
+                }
+                if(entry->funcArg != ""){
+                    output::errorUndef($$->lineno, ((IdNode*)$1)->id);
+                    cleanUpNodes();
+                    exit(1);
+                }
+                
+                string loadedVar = handler.freshVar();
+                handler.codeBuffer.emit(loadedVar + " = load i32, i32* " + entry->var);
+
+                $1->type = entry->type;
+                $1->var = loadedVar;
+                $$ = $1;
+            }
+
+exp:        call
+            {
+                $$ = $1;
+            }
+
+exp:        NUM
+            {
+                $$ = new NumNode($1->lineno, ((NumNode*)$1)->num, $1->type, handler.freshVar());
+                handler.codeBuffer.emit($$->var + " = add i32 " + to_string(((NumNode*)$$)->num) + ", 0");
+            }
+
+exp:        NUM B
+            {
+                if(((NumNode*)$1)->num > 255){
+                    output::errorByteTooLarge($$->lineno, to_string(((NumNode*)$1)->num));
+                    cleanUpNodes();
+                    exit(1);
+                }
+                
+                $$ = new NumNode($1->lineno, ((NumNode*)$1)->num, "BYTE", handler.freshVar());
+                handler.codeBuffer.emit($$->var + " = add i8 " + to_string(((NumNode*)$$)->num) + ", 0");
+                }
+
+exp:        STRING
+            {
+                ((StringNode*)$1)->str.pop_back();
+                $1->var = handler.globalFreshVar();
+                handler.codeBuffer.emitGlobal($1->var + " = constant [" + to_string(((StringNode*)$1)->str.length()) + " x i8] c" + ((StringNode*)$1)->str + "\\00\"");
+                string varptr = handler.freshVar();         //$1->var.replace(0, 1, "%");
+                handler.codeBuffer.emit(varptr + " = getelementptr [" + to_string(((StringNode*)$1)->str.length()) + " x i8], " + "[" + to_string(((StringNode*)$1)->str.length()) + " x i8]* " + $1->var + ", i32 0, i32 0");
+                $1->var = varptr;
+                $$ = $1;
+            }
+
+exp :       TRUE
+            {
+                $1->var = handler.freshVar();
+                handler.codeBuffer.emit($1->var + " = add i1 1, 0");
+                $$ = new BoolVarNode($1->lineno, "BOOL", $1->var);
+            };
+
+exp:        FALSE
+            {
+                $1->var = handler.freshVar();
+                handler.codeBuffer.emit($1->var + " = add i1 0, 0");
+                $$ = new BoolVarNode($1->lineno, "BOOL", $1->var);
+            }
+
+exp:        NOT exp
+            {
+                if($2->print_Node() != "BOOL"){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+
+                if(dynamic_cast<IdNode*>($2)){  //if id
+                    string toTrunc = handler.freshVar();
+                    handler.codeBuffer.emit(toTrunc + " = trunc i32 " + $2->var + " to i1");
+                    $2->var = toTrunc;
+                }
+
+                string newVar = handler.freshVar();
+                handler.codeBuffer.emit(newVar + " = sub i1 1, " + $2->var);
+
+                $$ = new BoolVarNode($1->lineno, "BOOL", newVar);
+            }
+
+exp:        exp AND {handler.handleOrAnd($1); handler.codeBuffer.emit(((BoolVarNode*)$1)->truelab + ":");} exp
+            {
+                if($4->type != "BOOL"){
+                    output::errorMismatch($$->lineno);
+                    exit(1);
+                }
+                
+                if(dynamic_cast<IdNode*>($4)){  //if id
+                    string toTrunc = handler.freshVar();
+                    handler.codeBuffer.emit(toTrunc + " = trunc i32 " + $4->var + " to i1");
+                    $4->var = toTrunc;
+                }
+
+                string endLabel = handler.codeBuffer.freshLabel();
+
+                string stupidLabel = handler.codeBuffer.freshLabel();
+                handler.codeBuffer.emit("br label %" + stupidLabel);
+                handler.codeBuffer.emit(stupidLabel + ":");
+
+                string var1 = handler.freshVar();
+                handler.codeBuffer.emit(var1 + " = add i1 " + $4->var + ", 0");
+                handler.codeBuffer.emit("br label %" + endLabel);
+
+                string var2 = handler.freshVar();
+                handler.codeBuffer.emit(((BoolVarNode*)$1)->falselab + ":");
+                handler.codeBuffer.emit(var2 + " = add i1 " + $1->var + ", 0");
+                handler.codeBuffer.emit("br label %" + endLabel);
+
+                string newVar = handler.freshVar();
+                handler.codeBuffer.emit(endLabel + ":");
+                handler.codeBuffer.emit(newVar + " = phi i1 [" + var1 + ", %" + stupidLabel + "], [" + var2 + ", %" + ((BoolVarNode*)$1)->falselab + "]");
+
+
+                $$ = new BoolVarNode($$->lineno, "BOOL", newVar);
+            }
+
+
+exp:        exp OR {handler.handleOrAnd($1); handler.codeBuffer.emit(((BoolVarNode*)$1)->falselab + ":");} exp 
+            {
+                
+                if($4->type != "BOOL"){
+                    output::errorMismatch($$->lineno);
+                    exit(1);
+                }
+                
+                if(dynamic_cast<IdNode*>($4)){  //if id
+                    string toTrunc = handler.freshVar();
+                    handler.codeBuffer.emit(toTrunc + " = trunc i32 " + $4->var + " to i1");
+                    $4->var = toTrunc;
+                }
+
+                string endLabel = handler.codeBuffer.freshLabel();
+
+                string stupidLabel = handler.codeBuffer.freshLabel();
+                handler.codeBuffer.emit("br label %" + stupidLabel);
+                handler.codeBuffer.emit(stupidLabel + ":");
+
+                string var1 = handler.freshVar();
+                handler.codeBuffer.emit(var1 + " = add i1 " + $4->var + ", 0");
+                handler.codeBuffer.emit("br label %" + endLabel);
+
+                string var2 = handler.freshVar();
+                handler.codeBuffer.emit(((BoolVarNode*)$1)->truelab + ":");
+                handler.codeBuffer.emit(var2 + " = add i1 " + $1->var + ", 0");
+                handler.codeBuffer.emit("br label %" + endLabel);
+
+                string newVar = handler.freshVar();
+                handler.codeBuffer.emit(endLabel + ":");
+                //if  (BoolVarNode*)$4 then $1->falselab = $4->next 
+                handler.codeBuffer.emit(newVar + " = phi i1 [" + var1 + ", %" + stupidLabel + "], [" + var2 + ", %" + ((BoolVarNode*)$1)->truelab + "]");
+
+
+                $$ = new BoolVarNode($$->lineno, "BOOL", newVar);
+            }
+
+
+//B-> b1 or b2 {B.false = B2.false B.true = b2.true }
+
+
+exp:        exp RELATIONAL exp
+            {
+                if(($1->print_Node() != "INT") && ($1->print_Node() != "BYTE") || ($3->print_Node() != "INT") && ($3->print_Node() != "BYTE")){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                $$ = new BoolVarNode($$->lineno, "BOOL", handler.freshVar());
+                allocatedNodes.push_back($$);
+                handler.handle_relop($$, $1, $3, $2->type);
+            }
+            |
+            exp EQUAL exp
+            {
+                if(($1->print_Node() == "STRING") || (($1->print_Node() != $3->print_Node()) && (!($1->print_Node() == "INT" && $3->print_Node() == "BYTE") && !($1->print_Node() == "BYTE" && $3->print_Node() == "INT")))) {
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                $$ = new BoolVarNode($$->lineno, "BOOL", handler.freshVar());
+                allocatedNodes.push_back($$);
+                handler.handle_relop($$, $1, $3, $2->type);
+            }
+
+exp:        LPAREN type RPAREN exp
+            {
+                if(($2->print_Node() != "INT") && ($2->print_Node() != "BYTE") || ($4->print_Node() != "INT") && ($4->print_Node() != "BYTE")){
+                    output::errorMismatch($$->lineno);
+                    cleanUpNodes();
+                    exit(1);
+                }
+
+                string changedVar = handler.freshVar();
+                if($2->type == "INT" && $4->type == "BYTE" && !dynamic_cast<IdNode*>($4))
+                    handler.codeBuffer.emit(changedVar + " = zext i8 " + $4->var + " to i32");
+                else if($2->type == "BYTE" && $4->type == "INT")
+                    handler.codeBuffer.emit(changedVar + " = trunc i32 " + $4->var + " to i8");
+
+                $4->type = $2->type;
+
+                $$ = $4;
+                $$->var = changedVar;
+            }
+
+
+%%
+
+int main() {
+
+    handler.startingPrints();
+    handler.codeBuffer.emit("define i32 @main(){");
+
+    symtable.rbpvar = handler.freshVar();
+    handler.codeBuffer.emit(symtable.rbpvar + " = alloca i32, i32 50");
+
+
+    yyparse(); 
+
+    closeScope();
+    cleanUpNodes();
+
+    handler.codeBuffer.emit("ret i32 0");
+    handler.codeBuffer.emit("}");
+    handler.codeBuffer.printGlobalBuffer();
+    handler.codeBuffer.printCodeBuffer();
+
+    return 0;
+} 
+
+int yyerror(const char* s)
+{
+    output::errorSyn(yylineno);
+    cleanUpNodes();
+    exit(1);
+    return 0;
+}
