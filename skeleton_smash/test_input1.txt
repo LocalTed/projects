@@ -1,0 +1,6 @@
+
+chprompt hello
+sleep 5&
+chprompt
+sleep 10&
+quit kill
